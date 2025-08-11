@@ -1,0 +1,371 @@
+DELIMITER $$
+
+CREATE PROCEDURE sp_refresh_views_fwsbizlink2()
+
+BEGIN
+	DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+    DECLARE err_code VARCHAR(5) DEFAULT '00000';
+    DECLARE err_msg TEXT DEFAULT 'Unknown error occurred';
+    
+    -- Get diagnostic information with fallback values
+    GET DIAGNOSTICS CONDITION 1 
+        err_code = RETURNED_SQLSTATE, 
+        err_msg = MESSAGE_TEXT;
+    
+    -- Ensure we never log NULL values
+    SET err_code = COALESCE(err_code, '99999');
+    SET err_msg = COALESCE(err_msg, 'No error message available');
+    
+    -- Log the error with additional context
+    INSERT INTO error_log (
+        error_code, 
+        error_message, 
+        error_time,
+        procedure_name,
+        execution_context
+    ) VALUES (
+        err_code, 
+        err_msg, 
+        CURRENT_TIMESTAMP,
+        'sp_refresh_views_fwsbizlink2',
+        CONCAT('Error occurred at: ', NOW())
+    );
+    
+    -- Return meaningful error information
+    SELECT 
+        err_code AS 'Error Code',
+        err_msg AS 'Error Message',
+        CURRENT_TIMESTAMP AS 'Error Time',
+        'Procedure: sp_refresh_views_fwsbizlink2' AS 'Context';
+END;
+
+	-- === Payroll Header View ===
+	DROP VIEW IF EXISTS vw_Payroll_Header;
+	CREATE VIEW vw_Payroll_Header AS
+    
+SELECT 
+    'H' AS Header_Constant,
+   
+    CASE 
+        WHEN DATE(gpt.trans_date) IN (
+            '2025-01-01', -- New Year's Day
+			'2025-04-09', -- Araw ng Kagitingan
+			'2025-04-17', -- Maundy Thursday
+			'2025-04-18', -- Good Friday
+			'2025-05-01', -- Labor Day
+			'2025-06-12', -- Independence Day
+			'2025-08-28', -- National Heroes Day
+			'2025-11-01', -- All Saints' Day
+			'2025-11-02', -- All Souls' Day
+			'2025-11-30', -- Bonifacio Day
+			'2025-12-25', -- Christmas Day
+			'2025-12-30'  -- Rizal Day
+        ) THEN 
+            -- DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY), '%m%d%Y')
+			CASE 
+				-- Check if the next day is Saturday
+				WHEN DAYOFWEEK(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY)) = 7 THEN 
+					DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 3 DAY), '%m%d%Y') -- Move to Monday
+				-- Check if the next day is Sunday
+				WHEN DAYOFWEEK(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY)) = 1 THEN 
+					DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 2 DAY), '%m%d%Y') -- Move to Monday
+				-- If the next day is a weekday
+				ELSE 
+					DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY), '%m%d%Y')
+			END
+        WHEN DAYOFWEEK(gpt.trans_date) = 6 THEN  -- Friday        
+			CASE 
+                WHEN TIME(gpt.trans_date) <= '20:00:00' THEN  -- 8pm and below
+                    DATE_FORMAT(DATE(gpt.trans_date), '%m%d%Y') -- same trans_date
+                ELSE 
+                    DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 3 DAY), '%m%d%Y') -- if beyond 8pm then trans_date + 3
+            END
+            
+        WHEN DAYOFWEEK(gpt.trans_date) = 7 THEN  -- Saturday
+            DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 2 DAY), '%m%d%Y')
+        
+        WHEN DAYOFWEEK(gpt.trans_date) = 1 THEN  -- Sunday
+            DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY), '%m%d%Y')
+            
+        WHEN DATE(gpt.trans_date) = CURDATE() THEN
+            CASE 
+                WHEN TIME(gpt.trans_date) <= '20:00:00' THEN  -- 8pm and below
+                    DATE_FORMAT(DATE(gpt.trans_date), '%m%d%Y') -- same trans_date
+                ELSE 
+                    DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY), '%m%d%Y') -- if beyond 8pm then trans_date + 1
+            END
+        
+        WHEN DATE(gpt.trans_date) < CURDATE() THEN 
+            DATE_FORMAT(CURDATE(), '%m%d%Y')
+        ELSE 
+            DATE_FORMAT(DATE(gpt.trans_date), '%m%d%Y')
+    END AS Payroll_Date,
+
+    CASE 
+        WHEN DATE(gpt.trans_date) = CURDATE() AND TIME(gpt.trans_date) >= '20:01:00' THEN 
+            '07:00 AM'
+        WHEN DATE(gpt.trans_date) > CURDATE() THEN 
+            '07:00 AM'
+        ELSE 
+            ''
+    END AS Transaction_Time,
+            
+            
+		ROUND(gpt.total_amount, 2) AS Transaction_Amount,
+		LPAD(CONVERT(gpt.total_instrument USING utf8), 5, '0') AS Transaction_Count,
+		bcanm.bizlink_acct_no AS funding_Account,
+		gptd.credit_description AS Client_Reference_Number,
+        
+		gpt.process_ref_no,
+		gptd.product_code,
+		gpt.client_code,
+	    bccm.bizlink_id,
+		gptd.beneficiary_account AS rbank_bene_acct,
+        gptd.debit_account AS rbank_debit_acct
+
+
+	FROM gcp_pay_tran_detail_tbl gptd
+JOIN gcp_pay_tran_tbl gpt
+    ON gptd.process_ref_no = gpt.process_ref_no
+JOIN biz_client_account_no_mapping bcanm
+    ON gpt.client_code = bcanm.acct_name
+JOIN beneficiary_bizlink_intermi bbi
+    ON bbi.rbank_bene_acct_no = gptd.beneficiary_account
+JOIN biz_client_code_mapping bccm 
+	ON bccm.rbank_id = gpt.client_code
+WHERE gpt.flag = 0
+AND gptd.product_code = 'PAYROLL'
+AND (
+    gpt.client_code IN (SELECT bccm.rbank_id FROM biz_client_code_mapping bccm)
+    OR gpt.client_code IN (SELECT bccm.bizlink_id FROM biz_client_code_mapping bccm)
+)
+group by gpt.process_ref_no;
+
+-- === Payroll Details View ===
+	DROP VIEW IF EXISTS vw_Payroll_details;
+	CREATE VIEW vw_Payroll_details AS 
+	SELECT 
+	'D' AS Detail_Constant,
+	bcanm.bizlink_bene_acct_no AS Employee_Account,
+	gptd.beneficiary_name AS Beneficiary_Name,    
+	ROUND(gptd.transaction_amount, 2)  AS Amount,    
+	gpt.process_ref_no,
+	gptd.product_code,
+	CONCAT(gptd.product_code, '|', gptd.process_ref_no ) AS Remarks
+
+	FROM gcp_pay_tran_detail_tbl gptd
+JOIN gcp_pay_tran_tbl gpt
+    ON gptd.process_ref_no = gpt.process_ref_no
+JOIN biz_client_account_no_mapping bcanm
+    ON gptd.beneficiary_account = bcanm.rbank_bene_acct_no
+JOIN beneficiary_bizlink_intermi bbi
+    ON bbi.rbank_bene_acct_no = gptd.beneficiary_account
+WHERE gpt.flag = 0
+AND gptd.product_code = 'PAYROLL'
+AND (
+    gpt.client_code IN (SELECT rbank_id FROM biz_client_code_mapping)
+    OR gpt.client_code IN (SELECT bizlink_id FROM biz_client_code_mapping)
+) group by 
+gpt.process_ref_no,
+bcanm.bizlink_bene_acct_no;
+
+
+	-- === Supplier Header View ===
+	DROP VIEW IF EXISTS vw_supplier_header;
+	CREATE VIEW vw_supplier_header AS
+	SELECT DISTINCT
+	'H' AS Detail_Constant,
+    bcanm.bizlink_acct_no AS funding_Account,	
+    gpt.process_ref_no,
+    gptd.product_code,
+	bccm.bizlink_id,
+    gpt.client_code
+
+	FROM gcp_pay_tran_detail_tbl gptd
+JOIN gcp_pay_tran_tbl gpt
+    ON gptd.process_ref_no = gpt.process_ref_no
+JOIN biz_client_account_no_mapping bcanm
+    ON gpt.client_code = bcanm.acct_name
+JOIN beneficiary_bizlink_intermi bbi
+    ON bbi.rbank_bene_acct_no = gptd.beneficiary_account
+JOIN biz_client_code_mapping bccm 
+	ON bccm.rbank_id = gpt.client_code
+WHERE gpt.flag = 0
+AND gptd.product_code IN ('SUPPLIER', 'SUPPLIER1', 'SUPPLIER2')
+AND (
+    gpt.client_code IN (SELECT bccm.rbank_id FROM biz_client_code_mapping bccm)
+    OR gpt.client_code IN (SELECT bccm.bizlink_id FROM biz_client_code_mapping bccm)
+) group by bcanm.bizlink_acct_no;
+
+
+		-- === Supplier Details View ===
+	DROP VIEW IF EXISTS vw_supplier_details;
+	CREATE VIEW vw_supplier_details AS
+	SELECT
+	'D' AS Detail_Constant,
+	bcanm.bizlink_bene_acct_no AS Beneficiary_Account_Number,
+	gptd.credit_description  AS  Client_Reference_Number,
+	ROUND(gptd.transaction_amount, 2) AS Amount,
+    gpt.process_ref_no,
+    gptd.product_code
+    
+
+FROM gcp_pay_tran_detail_tbl gptd
+JOIN gcp_pay_tran_tbl gpt
+    ON gptd.process_ref_no = gpt.process_ref_no
+JOIN biz_client_account_no_mapping bcanm
+    ON gpt.client_code = bcanm.acct_name
+JOIN beneficiary_bizlink_intermi bbi
+    ON bbi.rbank_bene_acct_no = gptd.beneficiary_account
+JOIN biz_client_code_mapping bccm 
+	ON bccm.rbank_id = gpt.client_code
+WHERE gpt.flag = 0
+AND gptd.product_code IN ('SUPPLIER', 'SUPPLIER1', 'SUPPLIER2')
+AND (
+    gpt.client_code IN (SELECT bccm.rbank_id FROM biz_client_code_mapping bccm)
+    OR gpt.client_code IN (SELECT bccm.bizlink_id FROM biz_client_code_mapping bccm)
+) group by bcanm.bizlink_bene_acct_no;
+
+
+  -- === Pesonet Header View ===
+    DROP VIEW IF EXISTS vw_pesonet_header;
+	CREATE VIEW vw_pesonet_header AS    
+	SELECT  DISTINCT
+	'H' AS Detail_Constant,
+	gpt.total_instrument AS Total_Count,
+	ROUND(gpt.total_amount, 2) AS total_amount,
+	gpt.process_ref_no,
+	gptd.product_code,
+	bccm.bizlink_id,
+    gpt.client_code
+    
+FROM gcp_pay_tran_detail_tbl gptd
+JOIN gcp_pay_tran_tbl gpt
+    ON gptd.process_ref_no = gpt.process_ref_no
+JOIN biz_client_account_no_mapping bcanm
+    ON gpt.client_code = bcanm.acct_name
+JOIN beneficiary_bizlink_intermi bbi
+    ON bbi.rbank_bene_acct_no = gptd.beneficiary_account
+JOIN biz_client_code_mapping bccm 
+	ON bccm.rbank_id = gpt.client_code
+WHERE gpt.flag = 0
+AND gptd.product_code = 'PESONET'
+AND (
+    gpt.client_code IN (SELECT bccm.rbank_id FROM biz_client_code_mapping bccm)
+    OR gpt.client_code IN (SELECT bccm.bizlink_id FROM biz_client_code_mapping bccm)
+);
+      -- === Pesonet Details View ===      
+    DROP VIEW IF EXISTS vw_pesonet_details;
+	CREATE VIEW vw_pesonet_details AS  
+    
+    SELECT
+	'D' AS Constant,
+     CASE 
+        WHEN DATE(gpt.trans_date) IN (
+            '2025-01-01', -- New Year's Day
+			'2025-04-09', -- Araw ng Kagitingan
+			'2025-04-17', -- Maundy Thursday
+			'2025-04-18', -- Good Friday
+			'2025-05-01', -- Labor Day
+			'2025-06-12', -- Independence Day
+			'2025-08-28', -- National Heroes Day
+			'2025-11-01', -- All Saints' Day
+			'2025-11-02', -- All Souls' Day
+			'2025-11-30', -- Bonifacio Day
+			'2025-12-25', -- Christmas Day
+			'2025-12-30'  -- Rizal Day
+        ) THEN 
+            -- DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY), '%m%d%Y')
+			CASE 
+				-- Check if the next day is Saturday
+				WHEN DAYOFWEEK(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY)) = 7 THEN 
+					DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 3 DAY), '%m%d%Y') -- Move to Monday
+				-- Check if the next day is Sunday
+				WHEN DAYOFWEEK(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY)) = 1 THEN 
+					DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 2 DAY), '%m%d%Y') -- Move to Monday
+				-- If the next day is a weekday
+				ELSE 
+					DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY), '%m%d%Y')
+			END
+        WHEN DAYOFWEEK(gpt.trans_date) = 6 THEN  -- Friday        
+			CASE 
+                WHEN TIME(gpt.trans_date) <= '20:00:00' THEN  -- 8pm and below
+                    DATE_FORMAT(DATE(gpt.trans_date), '%m%d%Y') -- same trans_date
+                ELSE 
+                    DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 3 DAY), '%m%d%Y') -- if beyond 8pm then trans_date + 3
+            END
+            
+        WHEN DAYOFWEEK(gpt.trans_date) = 7 THEN  -- Saturday
+            DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 2 DAY), '%m%d%Y')
+        
+        WHEN DAYOFWEEK(gpt.trans_date) = 1 THEN  -- Sunday
+            DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY), '%m%d%Y')
+            
+        WHEN DATE(gpt.trans_date) = CURDATE() THEN
+            CASE 
+                WHEN TIME(gpt.trans_date) <= '20:00:00' THEN  -- 8pm and below
+                    DATE_FORMAT(DATE(gpt.trans_date), '%m%d%Y') -- same trans_date
+                ELSE 
+                    DATE_FORMAT(DATE_ADD(DATE(gpt.trans_date), INTERVAL 1 DAY), '%m%d%Y') -- if beyond 8pm then trans_date + 1
+            END
+        
+        WHEN DATE(gpt.trans_date) < CURDATE() THEN 
+            DATE_FORMAT(CURDATE(), '%m%d%Y')
+        ELSE 
+            DATE_FORMAT(DATE(gpt.trans_date), '%m%d%Y')
+    END AS Payroll_Date,
+
+    CASE 
+        WHEN DATE(gpt.trans_date) = CURDATE() AND TIME(gpt.trans_date) >= '20:01:00' THEN 
+            '07:00 AM'
+        WHEN DATE(gpt.trans_date) > CURDATE() THEN 
+            '07:00 AM'
+        ELSE 
+            ''
+    END AS Transaction_Time,
+	
+	bcanm.bizlink_acct_no AS Account,
+	bcanm.bizlink_bene_acct_no AS Beneficiary_Account,
+	gptd.transaction_amount AS Amount,
+	gptd.detail_reference_number AS Client_Reference_Number,
+	gptd.beneficiary_bank_code AS Bank,
+	gptd.beneficiary_address_line_1 AS Address_1,
+	gptd.beneficiary_city AS  Address_2,
+	gptd.beneficiary_state AS Address_3,
+	bbi.EmailAddress,
+	bbi.CountryCode,
+	bbi.MobileNumber,
+	DATE_FORMAT(bbi.BirthdayOrRegistrationDate, '%d/%m/%Y') AS Birthday_Registration_Date,
+	bbi.Purpose,	
+	bbi.BeneficiaryType,
+	bbi.BeneficiaryName,
+	bbi.FirstName,
+	bbi.MiddleName,
+	bbi.LastName,
+	bbi.Gender,
+    CONCAT(gptd.product_code, '|', gpt.process_ref_no ) AS Remarks,
+    
+	gptd.process_ref_no,
+	gpt.client_code
+
+FROM gcp_pay_tran_detail_tbl gptd
+JOIN gcp_pay_tran_tbl gpt
+    ON gptd.process_ref_no = gpt.process_ref_no
+JOIN biz_client_account_no_mapping bcanm
+    ON gpt.client_code = bcanm.acct_name
+JOIN beneficiary_bizlink_intermi bbi
+    ON bbi.rbank_bene_acct_no = gptd.beneficiary_account
+JOIN biz_client_code_mapping bccm 
+	ON bccm.rbank_id = gpt.client_code
+WHERE gpt.flag = 0
+AND gptd.product_code = 'PESONET'
+AND (
+    gpt.client_code IN (SELECT bccm.rbank_id FROM biz_client_code_mapping bccm)
+    OR gpt.client_code IN (SELECT bccm.bizlink_id FROM biz_client_code_mapping bccm)
+)
+group by bcanm.bizlink_bene_acct_no, gptd.process_ref_no ;
+
+    END $$
+
+DELIMITER ; 
